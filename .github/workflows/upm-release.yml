@@ -1,0 +1,93 @@
+name: UPM release
+
+# Reusable workflow that packs a CupkekGames Unity package on tag push and
+# uploads it to the GitHub Release. Sibling repos call this from a 5-line
+# release.yml. Tarballs + sidecar JSON in GitHub Releases are read at runtime
+# by the dynamic packument route at docs.cupkek.games/upm/[package].
+#
+# Sidecar JSON shape (per release):
+#   { shasum, integrity, packageJson }
+# where shasum/integrity are computed from the .tgz bytes and packageJson is
+# the verbatim package.json so the route handler doesn't need a second fetch.
+
+on:
+  workflow_call:
+    inputs:
+      include-samples:
+        description: 'Include Samples~/ in the published tarball.'
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches package.json version
+        run: |
+          PKG_VER=$(jq -r .version package.json)
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VER" != "$TAG_VER" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VER"
+            exit 1
+          fi
+
+      - name: Build npm-style tarball
+        id: pack
+        env:
+          INCLUDE_SAMPLES: ${{ inputs.include-samples }}
+        run: |
+          NAME=$(jq -r .name package.json)
+          VER=$(jq -r .version package.json)
+
+          mkdir -p out/package
+
+          EXCLUDES=(
+            --exclude='.git'
+            --exclude='.github'
+            --exclude='node_modules'
+            --exclude='*.csproj'
+            --exclude='*.sln'
+            --exclude='out'
+          )
+          if [ "$INCLUDE_SAMPLES" != "true" ]; then
+            EXCLUDES+=(--exclude='Samples~')
+          fi
+
+          rsync -a "${EXCLUDES[@]}" ./ out/package/
+
+          # Deterministic tar so re-tagging the same SHA produces identical hashes.
+          tar --sort=name \
+              --owner=0 --group=0 --numeric-owner \
+              --mtime='1970-01-01 00:00:00 UTC' \
+              -czf "out/${NAME}-${VER}.tgz" -C out package
+
+          echo "name=$NAME"     >> "$GITHUB_OUTPUT"
+          echo "version=$VER"   >> "$GITHUB_OUTPUT"
+          echo "tgz=out/${NAME}-${VER}.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Build sidecar JSON
+        run: |
+          NAME=${{ steps.pack.outputs.name }}
+          VER=${{ steps.pack.outputs.version }}
+          TGZ=${{ steps.pack.outputs.tgz }}
+
+          SHASUM=$(sha1sum "$TGZ" | cut -d' ' -f1)
+          INTEGRITY="sha512-$(openssl dgst -sha512 -binary "$TGZ" | base64 -w0)"
+
+          jq -n \
+            --arg shasum "$SHASUM" \
+            --arg integrity "$INTEGRITY" \
+            --slurpfile pkg package.json \
+            '{ shasum: $shasum, integrity: $integrity, packageJson: $pkg[0] }' \
+            > "out/${NAME}-${VER}.json"
+
+      - name: Upload tarball + sidecar to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.tgz
+            out/*.json
