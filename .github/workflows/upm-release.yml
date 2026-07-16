@@ -1,14 +1,28 @@
 name: UPM release
 
 # Reusable workflow that packs a CupkekGames Unity package on tag push and
-# uploads it to the GitHub Release. Sibling repos call this from a 5-line
-# release.yml. Tarballs + sidecar JSON in GitHub Releases are read at runtime
-# by the dynamic packument route at docs.cupkek.games/upm/[package].
+# uploads it to the GitHub Release. Sibling repos call this from a 6-line
+# release.yml (with `secrets: inherit`). Tarballs + sidecar JSON in GitHub
+# Releases are read at runtime by the dynamic packument route at
+# docs.cupkek.games/upm/[package].
+#
+# Signing: when the org secrets UPM_SERVICE_ACCOUNT_KEY_ID /
+# UPM_SERVICE_ACCOUNT_KEY_SECRET / UPM_ORGANIZATION_ID are present, the
+# tarball is packed AND signed with Unity's standalone UPM CLI (`upm pack`,
+# embeds .attestation.p7m -> "Limited signature" in Unity 6.3+, the best
+# status available to a non-Unity publisher). If the secrets are set but
+# signing fails, the release FAILS (never silently publish unsigned when
+# signing was intended). Without the secrets it falls back to the legacy
+# unsigned deterministic tar. Note: signed tarballs are NOT byte-deterministic
+# across re-runs (the attestation embeds signing metadata), so re-tagging the
+# same SHA changes shasum/integrity - harmless, Unity's cacache is
+# integrity-keyed and refetches automatically.
 #
 # Sidecar JSON shape (per release):
 #   { shasum, integrity, packageJson }
-# where shasum/integrity are computed from the .tgz bytes and packageJson is
-# the verbatim package.json so the route handler doesn't need a second fetch.
+# where shasum/integrity are computed from the final (signed) .tgz bytes and
+# packageJson is the verbatim package.json so the route handler doesn't need
+# a second fetch.
 
 on:
   workflow_call:
@@ -17,6 +31,13 @@ on:
         description: 'Include Samples~/ in the published tarball.'
         type: boolean
         default: true
+    secrets:
+      UPM_SERVICE_ACCOUNT_KEY_ID:
+        required: false
+      UPM_SERVICE_ACCOUNT_KEY_SECRET:
+        required: false
+      UPM_ORGANIZATION_ID:
+        required: false
 
 jobs:
   publish:
@@ -35,8 +56,8 @@ jobs:
             exit 1
           fi
 
-      - name: Build npm-style tarball
-        id: pack
+      - name: Stage package contents
+        id: stage
         env:
           INCLUDE_SAMPLES: ${{ inputs.include-samples }}
         run: |
@@ -59,20 +80,69 @@ jobs:
 
           rsync -a "${EXCLUDES[@]}" ./ out/package/
 
-          # Deterministic tar so re-tagging the same SHA produces identical hashes.
-          tar --sort=name \
-              --owner=0 --group=0 --numeric-owner \
-              --mtime='1970-01-01 00:00:00 UTC' \
-              -czf "out/${NAME}-${VER}.tgz" -C out package
+          echo "name=$NAME"   >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
 
-          echo "name=$NAME"     >> "$GITHUB_OUTPUT"
-          echo "version=$VER"   >> "$GITHUB_OUTPUT"
-          echo "tgz=out/${NAME}-${VER}.tgz" >> "$GITHUB_OUTPUT"
+      - name: Pack tarball (signed when org credentials exist)
+        id: pack
+        env:
+          NAME: ${{ steps.stage.outputs.name }}
+          VER: ${{ steps.stage.outputs.version }}
+          UPM_SERVICE_ACCOUNT_KEY_ID: ${{ secrets.UPM_SERVICE_ACCOUNT_KEY_ID }}
+          UPM_SERVICE_ACCOUNT_KEY_SECRET: ${{ secrets.UPM_SERVICE_ACCOUNT_KEY_SECRET }}
+          UPM_ORGANIZATION_ID: ${{ secrets.UPM_ORGANIZATION_ID }}
+        run: |
+          TGZ="out/${NAME}-${VER}.tgz"
+
+          if [ -n "$UPM_SERVICE_ACCOUNT_KEY_ID" ] && [ -n "$UPM_SERVICE_ACCOUNT_KEY_SECRET" ] && [ -n "$UPM_ORGANIZATION_ID" ]; then
+            echo "Signing credentials present - packing with Unity UPM CLI."
+            curl -fsSL https://cdn.packages.unity.com/upm-cli/install.sh | bash
+
+            # The installer's target dir isn't contractual; resolve the binary.
+            UPM=$(command -v upm || true)
+            if [ -z "$UPM" ]; then
+              UPM=$(find "$HOME" -maxdepth 5 -type f -name upm 2>/dev/null | head -1)
+            fi
+            if [ -z "$UPM" ]; then
+              echo "::error::upm CLI not found after install - signing was requested, refusing to publish unsigned"
+              exit 1
+            fi
+            "$UPM" --version
+
+            mkdir -p out/signed
+            "$UPM" pack out/package --organization-id "$UPM_ORGANIZATION_ID" --destination out/signed
+
+            SIGNED=$(ls out/signed/*.tgz 2>/dev/null | head -1)
+            if [ -z "$SIGNED" ]; then
+              echo "::error::upm pack produced no tarball - signing was requested, refusing to publish unsigned"
+              exit 1
+            fi
+
+            # Normalize to the name the packument route expects.
+            mv "$SIGNED" "$TGZ"
+
+            # Fail loud if the attestation is missing from the tarball.
+            if ! tar -tzf "$TGZ" | grep -q '\.attestation\.p7m$'; then
+              echo "::error::signed tarball contains no .attestation.p7m - refusing to publish"
+              exit 1
+            fi
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::UPM signing secrets not configured - publishing UNSIGNED tarball (Unity 6.3+ will warn)."
+            # Deterministic tar so re-tagging the same SHA produces identical hashes.
+            tar --sort=name \
+                --owner=0 --group=0 --numeric-owner \
+                --mtime='1970-01-01 00:00:00 UTC' \
+                -czf "$TGZ" -C out package
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "tgz=$TGZ" >> "$GITHUB_OUTPUT"
 
       - name: Build sidecar JSON
         run: |
-          NAME=${{ steps.pack.outputs.name }}
-          VER=${{ steps.pack.outputs.version }}
+          NAME=${{ steps.stage.outputs.name }}
+          VER=${{ steps.stage.outputs.version }}
           TGZ=${{ steps.pack.outputs.tgz }}
 
           SHASUM=$(sha1sum "$TGZ" | cut -d' ' -f1)
